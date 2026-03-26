@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::process::Command;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -106,6 +106,19 @@ struct TaskJsonRecord {
     due: Option<String>,
     file: String,
     description: Vec<String>,
+    subtasks: Vec<SubtaskJsonRecord>,
+}
+
+struct SubtaskJsonRecord {
+    done: bool,
+    text: String,
+    done_at: Option<String>,
+}
+
+struct SubtaskLine {
+    done: bool,
+    text: String,
+    done_at: Option<String>,
 }
 
 impl CoreFile {
@@ -159,6 +172,8 @@ fn run() -> Result<(), String> {
         "add" => cmd_add(&app, &args),
         "list" => cmd_list(&app, &args),
         "done" => cmd_done(&app, &args),
+        "subtask" => cmd_subtask(&app, &args),
+        "section" => cmd_section(&app, &args),
         "delete" => cmd_delete(&app, &args),
         "clean" => cmd_clean(&app, &args),
         "edit" => cmd_edit(&app, &args),
@@ -221,17 +236,25 @@ fn bootstrap_paths() -> io::Result<AppPaths> {
 
 fn cmd_add(app: &AppPaths, args: &[String]) -> Result<(), String> {
     if args.is_empty() {
-        return Err("usage: dodo add \"Task description\" [--file today|inbox|waiting|someday|projects/<name>] [--due YYYY-MM-DD] [--tag TAG]".to_string());
+        return Err("usage: dodo add \"Task description\" [--file today|inbox|waiting|someday|projects/<name>] [--section NAME] [--due YYYY-MM-DD] [--tag TAG]".to_string());
     }
 
-    let description = args[0].trim().to_string();
+    let description = args[0].trim();
     if description.is_empty() {
         return Err("task description must not be empty".to_string());
+    }
+    let (parsed_description, nlp_meta) = parse_nlp_metadata(description);
+    if parsed_description.is_empty() {
+        return Err("task description must not be empty after parsing metadata".to_string());
     }
 
     let mut file = TaskFile::Core(CoreFile::Inbox);
     let mut due: Option<String> = None;
+    let mut alarm: Option<String> = nlp_meta.time;
+    let mut recurrence: Option<&'static str> = nlp_meta.recurrence;
+    let mut priority: Option<&'static str> = nlp_meta.priority;
     let mut tags: Vec<String> = Vec::new();
+    let mut section: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -252,6 +275,15 @@ fn cmd_add(app: &AppPaths, args: &[String]) -> Result<(), String> {
                 }
                 due = Some(date.clone());
             }
+            "--section" => {
+                i += 1;
+                let name = args.get(i).ok_or("--section requires a value")?;
+                let cleaned = name.trim();
+                if cleaned.is_empty() {
+                    return Err("--section must not be empty".to_string());
+                }
+                section = Some(cleaned.to_string());
+            }
             "--tag" => {
                 i += 1;
                 let tag = args.get(i).ok_or("--tag requires a value")?;
@@ -266,22 +298,42 @@ fn cmd_add(app: &AppPaths, args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let mut task = format!("- [ ] {}", description);
+    let mut task = format!("- [ ] {}", parsed_description);
     for tag in tags {
         task.push(' ');
         task.push('#');
         task.push_str(&tag);
     }
+    if due.is_none() {
+        due = nlp_meta.due;
+    }
     if let Some(date) = due {
         task.push_str(" 📅 ");
         task.push_str(&date);
+    }
+    if let Some(time) = alarm.take() {
+        task.push_str(" ⏰ ");
+        task.push_str(&time);
+    }
+    if let Some(rule) = recurrence.take() {
+        task.push_str(" 🔁 ");
+        task.push_str(rule);
+    }
+    if let Some(level) = priority.take() {
+        task.push_str(" ⚡ ");
+        task.push_str(level);
     }
     let task_id = generate_new_task_id(app)?;
     task.push_str(" 🆔 ");
     task.push_str(&task_id);
 
     let path = task_file_path(app, &file);
-    append_line(&path, &task).map_err(|e| format!("failed to write task: {e}"))?;
+    if let Some(section_name) = section {
+        insert_task_under_section(&path, &task, &section_name)
+            .map_err(|e| format!("failed to write task: {e}"))?;
+    } else {
+        append_line(&path, &task).map_err(|e| format!("failed to write task: {e}"))?;
+    }
     set_current_file(app, &file).map_err(|e| format!("failed to set current file: {e}"))?;
 
     println!(
@@ -292,6 +344,191 @@ fn cmd_add(app: &AppPaths, args: &[String]) -> Result<(), String> {
     );
     println!("  {C_BLUE}•{C_RESET} {}", task);
     Ok(())
+}
+
+struct NlpMetadata {
+    due: Option<String>,
+    time: Option<String>,
+    recurrence: Option<&'static str>,
+    priority: Option<&'static str>,
+}
+
+fn parse_nlp_metadata(description: &str) -> (String, NlpMetadata) {
+    let tokens: Vec<&str> = description.split_whitespace().collect();
+    let mut kept: Vec<String> = Vec::new();
+    let mut due: Option<String> = None;
+    let mut time: Option<String> = None;
+    let mut recurrence: Option<&'static str> = None;
+    let mut priority: Option<&'static str> = None;
+    let today = today_ymd();
+
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let current = normalize_nlp_token(tokens[i]);
+
+        if matches!(current.as_str(), "idag" | "today") {
+            due = Some(today.clone());
+            i += 1;
+            continue;
+        }
+        if matches!(current.as_str(), "imorgon" | "tomorrow") {
+            due = add_days_to_date(&today, 1);
+            i += 1;
+            continue;
+        }
+
+        if i + 2 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "om"
+            && normalize_nlp_token(tokens[i + 2]) == "dagar"
+        {
+            if let Ok(days) = normalize_nlp_token(tokens[i + 1]).parse::<i64>() {
+                due = add_days_to_date(&today, days.max(0));
+                i += 3;
+                continue;
+            }
+        }
+        if i + 2 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "in"
+            && normalize_nlp_token(tokens[i + 2]) == "days"
+        {
+            if let Ok(days) = normalize_nlp_token(tokens[i + 1]).parse::<i64>() {
+                due = add_days_to_date(&today, days.max(0));
+                i += 3;
+                continue;
+            }
+        }
+
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "nästa"
+            && normalize_nlp_token(tokens[i + 1]) == "måndag"
+        {
+            due = next_weekday_date(&today, 1);
+            i += 2;
+            continue;
+        }
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "next"
+            && normalize_nlp_token(tokens[i + 1]) == "monday"
+        {
+            due = next_weekday_date(&today, 1);
+            i += 2;
+            continue;
+        }
+
+        if i + 1 < tokens.len() && normalize_nlp_token(tokens[i]) == "kl" {
+            if let Some(parsed) = parse_nlp_time_token(tokens[i + 1]) {
+                time = Some(parsed);
+                i += 2;
+                continue;
+            }
+        }
+
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "varje"
+            && normalize_nlp_token(tokens[i + 1]) == "dag"
+        {
+            recurrence = Some("daily");
+            i += 2;
+            continue;
+        }
+        if normalize_nlp_token(tokens[i]) == "daily" {
+            recurrence = Some("daily");
+            i += 1;
+            continue;
+        }
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "varje"
+            && normalize_nlp_token(tokens[i + 1]) == "vecka"
+        {
+            recurrence = Some("weekly");
+            i += 2;
+            continue;
+        }
+        if normalize_nlp_token(tokens[i]) == "weekly" {
+            recurrence = Some("weekly");
+            i += 1;
+            continue;
+        }
+
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "hög"
+            && normalize_nlp_token(tokens[i + 1]) == "prio"
+        {
+            priority = Some("high");
+            i += 2;
+            continue;
+        }
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "high"
+            && normalize_nlp_token(tokens[i + 1]) == "priority"
+        {
+            priority = Some("high");
+            i += 2;
+            continue;
+        }
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "låg"
+            && normalize_nlp_token(tokens[i + 1]) == "prio"
+        {
+            priority = Some("low");
+            i += 2;
+            continue;
+        }
+        if i + 1 < tokens.len()
+            && normalize_nlp_token(tokens[i]) == "low"
+            && normalize_nlp_token(tokens[i + 1]) == "priority"
+        {
+            priority = Some("low");
+            i += 2;
+            continue;
+        }
+
+        kept.push(tokens[i].to_string());
+        i += 1;
+    }
+
+    let cleaned = kept.join(" ");
+    (
+        cleaned.trim().to_string(),
+        NlpMetadata {
+            due,
+            time,
+            recurrence,
+            priority,
+        },
+    )
+}
+
+fn normalize_nlp_token(token: &str) -> String {
+    token
+        .trim_matches(|c: char| c.is_ascii_punctuation())
+        .to_lowercase()
+}
+
+fn parse_nlp_time_token(value: &str) -> Option<String> {
+    let normalized = normalize_nlp_token(value);
+    if let Some((hh, mm)) = normalized.split_once(':') {
+        if hh.len() == 2
+            && mm.len() == 2
+            && hh.chars().all(|c| c.is_ascii_digit())
+            && mm.chars().all(|c| c.is_ascii_digit())
+        {
+            let hours = hh.parse::<u32>().ok()?;
+            let mins = mm.parse::<u32>().ok()?;
+            if hours < 24 && mins < 60 {
+                return Some(format!("{hours:02}:{mins:02}"));
+            }
+        }
+        return None;
+    }
+
+    if normalized.chars().all(|c| c.is_ascii_digit()) {
+        let hours = normalized.parse::<u32>().ok()?;
+        if hours < 24 {
+            return Some(format!("{hours:02}:00"));
+        }
+    }
+    None
 }
 
 fn cmd_list(app: &AppPaths, args: &[String]) -> Result<(), String> {
@@ -501,6 +738,156 @@ fn cmd_done(app: &AppPaths, args: &[String]) -> Result<(), String> {
         label_id
     );
     println!("  {C_BLUE}•{C_RESET} {}", updated);
+    Ok(())
+}
+
+fn cmd_subtask(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    let action = args.first().ok_or(
+        "usage: dodo subtask add <parent-id> \"text\" | dodo subtask done <parent-id> <sub-num> | dodo subtask list <parent-id>",
+    )?;
+    match action.as_str() {
+        "add" => {
+            if args.len() < 3 {
+                return Err("usage: dodo subtask add <parent-id> \"text\"".to_string());
+            }
+            let parent_id = normalize_task_id(&args[1])?;
+            let text = args[2..].join(" ").trim().to_string();
+            if text.is_empty() {
+                return Err("subtask text must not be empty".to_string());
+            }
+            let (file, idx) = find_task_by_id(app, &parent_id, Some(&DoneSelection::All))?
+                .ok_or_else(|| format!("task with id {} not found", parent_id))?;
+            let path = task_file_path(app, &file);
+            let mut lines = read_lines(&path)
+                .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+            let insert_idx = task_block_end(&lines, idx);
+            let subtask_line = format!("    - [ ] {}", text);
+            lines.insert(insert_idx, subtask_line.clone());
+            write_lines(&path, &lines).map_err(|e| format!("failed to update task: {e}"))?;
+            println!(
+                "{C_GREEN}Subtask added{C_RESET} in {}{}{} (id {}):",
+                C_CYAN,
+                task_file_filename(&file),
+                C_RESET,
+                parent_id
+            );
+            println!("  {C_BLUE}•{C_RESET} {}", subtask_line);
+            Ok(())
+        }
+        "done" => {
+            if args.len() != 3 {
+                return Err("usage: dodo subtask done <parent-id> <sub-num>".to_string());
+            }
+            let parent_id = normalize_task_id(&args[1])?;
+            let sub_num: usize = args[2]
+                .parse()
+                .map_err(|_| "<sub-num> must be a positive number".to_string())?;
+            if sub_num == 0 {
+                return Err("<sub-num> must be >= 1".to_string());
+            }
+            let (file, idx) = find_task_by_id(app, &parent_id, Some(&DoneSelection::All))?
+                .ok_or_else(|| format!("task with id {} not found", parent_id))?;
+            let path = task_file_path(app, &file);
+            let mut lines = read_lines(&path)
+                .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+            let subtasks = collect_subtask_indices(&lines, idx);
+            if sub_num > subtasks.len() {
+                return Err(format!(
+                    "subtask {} not found for parent {} ({} subtasks)",
+                    sub_num,
+                    parent_id,
+                    subtasks.len()
+                ));
+            }
+            let sub_idx = subtasks[sub_num - 1];
+            let original = lines[sub_idx].clone();
+            if original.starts_with("    - [x] ") {
+                println!("{C_YELLOW}Already done{C_RESET}: {}", original);
+                return Ok(());
+            }
+            let mut updated = original.replacen("    - [ ]", "    - [x]", 1);
+            if !updated.contains('✅') {
+                updated.push_str(" ✅ ");
+                updated.push_str(&today_ymd());
+            }
+            lines[sub_idx] = updated.clone();
+            write_lines(&path, &lines).map_err(|e| format!("failed to update subtask: {e}"))?;
+            println!(
+                "{C_GREEN}Subtask done{C_RESET} in {}{}{} (parent {}, subtask {}):",
+                C_CYAN,
+                task_file_filename(&file),
+                C_RESET,
+                parent_id,
+                sub_num
+            );
+            println!("  {C_BLUE}•{C_RESET} {}", updated);
+            Ok(())
+        }
+        "list" => {
+            if args.len() != 2 {
+                return Err("usage: dodo subtask list <parent-id>".to_string());
+            }
+            let parent_id = normalize_task_id(&args[1])?;
+            let (file, idx) = find_task_by_id(app, &parent_id, Some(&DoneSelection::All))?
+                .ok_or_else(|| format!("task with id {} not found", parent_id))?;
+            let path = task_file_path(app, &file);
+            let lines = read_lines(&path)
+                .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+            let subtasks = collect_subtasks(&lines, idx);
+            println!(
+                "{C_BOLD}{C_CYAN}Subtasks for {} ({}){C_RESET}",
+                parent_id,
+                task_file_filename(&file)
+            );
+            if subtasks.is_empty() {
+                println!("  {C_BLUE}(none){C_RESET}");
+                return Ok(());
+            }
+            for (i, subtask) in subtasks.iter().enumerate() {
+                let marker = if subtask.done { "✓" } else { "□" };
+                println!("  {:>2}. {} {}", i + 1, marker, subtask.text);
+            }
+            Ok(())
+        }
+        _ => Err(
+            "usage: dodo subtask add <parent-id> \"text\" | dodo subtask done <parent-id> <sub-num> | dodo subtask list <parent-id>"
+                .to_string(),
+        ),
+    }
+}
+
+fn cmd_section(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) != Some("add") {
+        return Err("usage: dodo section add \"Name\" --file today|inbox|waiting|someday|projects/<name>".to_string());
+    }
+    if args.len() != 4 {
+        return Err(
+            "usage: dodo section add \"Name\" --file today|inbox|waiting|someday|projects/<name>"
+                .to_string(),
+        );
+    }
+    let name = args[1].trim();
+    if name.is_empty() {
+        return Err("section name must not be empty".to_string());
+    }
+    if args[2] != "--file" {
+        return Err(
+            "usage: dodo section add \"Name\" --file today|inbox|waiting|someday|projects/<name>"
+                .to_string(),
+        );
+    }
+    let file = parse_task_file(&args[3]).ok_or_else(|| {
+        "--file must be one of: inbox, today, waiting, someday, projects/<name>".to_string()
+    })?;
+    let path = task_file_path(app, &file);
+    add_section_header(&path, name).map_err(|e| format!("failed to update file: {e}"))?;
+    println!(
+        "{C_GREEN}Section added{C_RESET} in {}{}{}:",
+        C_CYAN,
+        task_file_filename(&file),
+        C_RESET
+    );
+    println!("  {C_BLUE}•{C_RESET} ## {}", name);
     Ok(())
 }
 
@@ -1078,7 +1465,7 @@ fn cmd_overdue(app: &AppPaths, args: &[String]) -> Result<(), String> {
                 let parsed = parse_task_line(&task.line);
                 TaskJsonRecord {
                     id: parsed.as_ref().and_then(|p| p.id.clone()),
-                    done: false,
+                    done: parsed.as_ref().is_some_and(|p| p.done),
                     text: parsed
                         .as_ref()
                         .map_or_else(|| task.line.clone(), |p| p.text.clone()),
@@ -1090,6 +1477,7 @@ fn cmd_overdue(app: &AppPaths, args: &[String]) -> Result<(), String> {
                         .into_iter()
                         .map(|d| d.trim_start_matches("  ").to_string())
                         .collect(),
+                    subtasks: Vec::new(),
                 }
             })
             .collect();
@@ -1179,6 +1567,14 @@ fn cmd_search(app: &AppPaths, args: &[String]) -> Result<(), String> {
                             .iter()
                             .map(|d| d.trim_start_matches("  ").to_string())
                             .collect(),
+                        subtasks: collect_subtasks(&lines, idx)
+                            .into_iter()
+                            .map(|s| SubtaskJsonRecord {
+                                done: s.done,
+                                text: s.text,
+                                done_at: s.done_at,
+                            })
+                            .collect(),
                     });
                 } else {
                     json_results.push(TaskJsonRecord {
@@ -1191,6 +1587,14 @@ fn cmd_search(app: &AppPaths, args: &[String]) -> Result<(), String> {
                         description: descriptions
                             .iter()
                             .map(|d| d.trim_start_matches("  ").to_string())
+                            .collect(),
+                        subtasks: collect_subtasks(&lines, idx)
+                            .into_iter()
+                            .map(|s| SubtaskJsonRecord {
+                                done: s.done,
+                                text: s.text,
+                                done_at: s.done_at,
+                            })
                             .collect(),
                     });
                 }
@@ -1212,7 +1616,7 @@ fn cmd_search(app: &AppPaths, args: &[String]) -> Result<(), String> {
             task_file_filename(&file)
         );
         for (i, (line, descriptions)) in matched.iter().enumerate() {
-            print_task_row(i + 1, line, false);
+            print_task_row(i + 1, line, false, None);
             for description in descriptions {
                 println!(
                     "      {C_DIM}{}{C_RESET}",
@@ -1451,7 +1855,7 @@ fn print_tasks_by_tag(app: &AppPaths, tag: &str, raw: bool) -> Result<(), String
         );
         for (i, (line, descriptions)) in matched.iter().enumerate() {
             let id = i + 1;
-            print_task_row(id, line, raw);
+            print_task_row(id, line, raw, None);
             for description in descriptions {
                 println!(
                     "      {C_DIM}{}{C_RESET}",
@@ -1470,19 +1874,16 @@ fn print_tasks_by_tag(app: &AppPaths, tag: &str, raw: bool) -> Result<(), String
 }
 
 fn append_line(path: &Path, line: &str) -> io::Result<()> {
-    with_file_lock(path, |lock_path| {
-        let mut lines = read_lines_or_empty(path)?;
-        lines.push(line.to_string());
-        write_lines_atomic(path, lock_path, &lines)
-    })
+    let mut f = OpenOptions::new().append(true).create(true).open(path)?;
+    writeln!(f, "{}", line)
 }
 
 fn append_lines(path: &Path, lines: &[String]) -> io::Result<()> {
-    with_file_lock(path, |lock_path| {
-        let mut all = read_lines_or_empty(path)?;
-        all.extend(lines.iter().cloned());
-        write_lines_atomic(path, lock_path, &all)
-    })
+    let mut f = OpenOptions::new().append(true).create(true).open(path)?;
+    for line in lines {
+        writeln!(f, "{}", line)?;
+    }
+    Ok(())
 }
 
 fn read_lines(path: &Path) -> io::Result<Vec<String>> {
@@ -1491,108 +1892,80 @@ fn read_lines(path: &Path) -> io::Result<Vec<String>> {
 }
 
 fn write_lines(path: &Path, lines: &[String]) -> io::Result<()> {
-    with_file_lock(path, |lock_path| write_lines_atomic(path, lock_path, lines))
-}
-
-fn read_lines_or_empty(path: &Path) -> io::Result<Vec<String>> {
-    match read_lines(path) {
-        Ok(lines) => Ok(lines),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn with_file_lock<T, F>(path: &Path, mut action: F) -> io::Result<T>
-where
-    F: FnMut(&Path) -> io::Result<T>,
-{
-    let lock_path = lock_path_for(path);
-    let start = SystemTime::now();
-    loop {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(_) => break,
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                let stale = is_stale_lock(&lock_path)?;
-                if stale {
-                    let _ = fs::remove_file(&lock_path);
-                    continue;
-                }
-                let waited = start.elapsed().unwrap_or(Duration::from_secs(0));
-                if waited >= Duration::from_secs(2) {
-                    return Err(io::Error::new(
-                        ErrorKind::WouldBlock,
-                        format!("timed out waiting for lock {}", lock_path.display()),
-                    ));
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    let result = action(&lock_path);
-    let _ = fs::remove_file(&lock_path);
-    result
-}
-
-fn is_stale_lock(lock_path: &Path) -> io::Result<bool> {
-    let metadata = match fs::metadata(lock_path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err),
-    };
-    let modified = metadata.modified()?;
-    let age = SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or(Duration::from_secs(0));
-    Ok(age > Duration::from_secs(5))
-}
-
-fn lock_path_for(path: &Path) -> PathBuf {
-    let file = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map_or_else(|| ".lock".to_string(), |s| format!(".{s}.lock"));
-    path.with_file_name(file)
-}
-
-fn temp_path_for(path: &Path) -> PathBuf {
-    let file = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map_or_else(|| ".tmp".to_string(), |s| format!(".{s}.tmp"));
-    path.with_file_name(file)
-}
-
-fn write_lines_atomic(path: &Path, lock_path: &Path, lines: &[String]) -> io::Result<()> {
     let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
-    write_string_atomic_locked(path, lock_path, &out)
+    fs::write(path, out)
 }
 
 fn write_string_atomic(path: &Path, content: &str) -> io::Result<()> {
-    with_file_lock(path, |lock_path| write_string_atomic_locked(path, lock_path, content))
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(tmp, path)
 }
 
-fn write_string_atomic_locked(path: &Path, lock_path: &Path, content: &str) -> io::Result<()> {
-    let temp_path = temp_path_for(path);
-    if temp_path == lock_path {
-        return Err(io::Error::new(
-            ErrorKind::Other,
-            format!("temp and lock paths collide for {}", path.display()),
-        ));
+fn section_title(line: &str) -> Option<&str> {
+    line.strip_prefix("## ").map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn add_section_header(path: &Path, name: &str) -> io::Result<()> {
+    let mut lines = if path.exists() {
+        read_lines(path)?
+    } else {
+        Vec::new()
+    };
+    let target = name.trim();
+    if lines
+        .iter()
+        .any(|line| section_title(line).is_some_and(|s| s == target))
+    {
+        return Ok(());
     }
-    let mut temp = File::create(&temp_path)?;
-    temp.write_all(content.as_bytes())?;
-    temp.sync_all()?;
-    drop(temp);
-    fs::rename(temp_path, path)
+    if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+        lines.push(String::new());
+    }
+    lines.push(format!("## {}", target));
+    write_lines(path, &lines)
+}
+
+fn insert_task_under_section(path: &Path, task: &str, section: &str) -> io::Result<()> {
+    let mut lines = if path.exists() {
+        read_lines(path)?
+    } else {
+        Vec::new()
+    };
+    let body_start = frontmatter_body_start(&lines);
+    let target = section.trim();
+    let mut section_idx: Option<usize> = None;
+    for idx in body_start..lines.len() {
+        if section_title(&lines[idx]).is_some_and(|name| name == target) {
+            section_idx = Some(idx);
+            break;
+        }
+    }
+    if let Some(header_idx) = section_idx {
+        let mut insert_idx = header_idx + 1;
+        while insert_idx < lines.len() && !is_section_header(&lines[insert_idx]) {
+            insert_idx += 1;
+        }
+        lines.insert(insert_idx, task.to_string());
+    } else {
+        if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("## {}", target));
+        lines.push(task.to_string());
+    }
+    write_lines(path, &lines)
+}
+
+fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    haystack.to_lowercase().contains(needle_lower)
+}
+
+fn run_recur(_app: &AppPaths, _quiet: bool) -> Result<usize, String> {
+    Ok(0)
 }
 
 fn task_line_indices(lines: &[String]) -> Vec<usize> {
@@ -1601,7 +1974,7 @@ fn task_line_indices(lines: &[String]) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(i, line)| {
-            if i >= body_start && is_task_line(line) {
+            if i >= body_start && is_top_level_task_line(line) {
                 Some(i)
             } else {
                 None
@@ -1611,7 +1984,20 @@ fn task_line_indices(lines: &[String]) -> Vec<usize> {
 }
 
 fn is_task_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ")
+}
+
+fn is_top_level_task_line(line: &str) -> bool {
     line.starts_with("- [ ] ") || line.starts_with("- [x] ")
+}
+
+fn is_subtask_line(line: &str) -> bool {
+    line.starts_with("    - [ ] ") || line.starts_with("    - [x] ")
+}
+
+fn is_section_header(line: &str) -> bool {
+    line.starts_with("## ") && line.trim().len() > 3
 }
 
 fn is_description_line(line: &str) -> bool {
@@ -1622,7 +2008,10 @@ fn is_description_line(line: &str) -> bool {
 
 fn task_block_end(lines: &[String], start_idx: usize) -> usize {
     let mut idx = start_idx + 1;
-    while idx < lines.len() && is_description_line(&lines[idx]) {
+    while idx < lines.len() {
+        if is_top_level_task_line(&lines[idx]) || is_section_header(&lines[idx]) {
+            break;
+        }
         idx += 1;
     }
     idx
@@ -1631,11 +2020,67 @@ fn task_block_end(lines: &[String], start_idx: usize) -> usize {
 fn collect_descriptions(lines: &[String], task_idx: usize) -> Vec<String> {
     let mut descriptions = Vec::new();
     let mut idx = task_idx + 1;
-    while idx < lines.len() && is_description_line(&lines[idx]) {
-        descriptions.push(lines[idx].clone());
+    let block_end = task_block_end(lines, task_idx);
+    while idx < block_end {
+        if is_description_line(&lines[idx]) {
+            descriptions.push(lines[idx].clone());
+        }
         idx += 1;
     }
     descriptions
+}
+
+fn parse_subtask_line(line: &str) -> Option<SubtaskLine> {
+    let (done, body) = if let Some(rest) = line.strip_prefix("    - [x] ") {
+        (true, rest)
+    } else if let Some(rest) = line.strip_prefix("    - [ ] ") {
+        (false, rest)
+    } else {
+        return None;
+    };
+    let mut text = body.to_string();
+    let mut done_at = None;
+    if let Some((head, tail)) = text.rsplit_once(" ✅ ") {
+        let token = tail.split_whitespace().next().unwrap_or("");
+        if is_valid_date(token) {
+            done_at = Some(token.to_string());
+            text = head.to_string();
+        }
+    }
+    Some(SubtaskLine {
+        done,
+        text: text.trim().to_string(),
+        done_at,
+    })
+}
+
+fn collect_subtask_indices(lines: &[String], task_idx: usize) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut idx = task_idx + 1;
+    let block_end = task_block_end(lines, task_idx);
+    while idx < block_end {
+        if is_subtask_line(&lines[idx]) {
+            indices.push(idx);
+        }
+        idx += 1;
+    }
+    indices
+}
+
+fn collect_subtasks(lines: &[String], task_idx: usize) -> Vec<SubtaskLine> {
+    collect_subtask_indices(lines, task_idx)
+        .into_iter()
+        .filter_map(|idx| parse_subtask_line(&lines[idx]))
+        .collect()
+}
+
+fn subtask_progress_label(lines: &[String], task_idx: usize) -> Option<String> {
+    let subtasks = collect_subtasks(lines, task_idx);
+    if subtasks.is_empty() {
+        return None;
+    }
+    let done = subtasks.iter().filter(|s| s.done).count();
+    Some(format!("({}/{})", done, subtasks.len()))
 }
 
 fn remove_completed_tasks(lines: &[String]) -> (Vec<String>, usize) {
@@ -1659,16 +2104,26 @@ fn remove_completed_tasks(lines: &[String]) -> (Vec<String>, usize) {
 fn print_numbered_tasks(lines: &[String], start_id: usize, raw: bool) -> usize {
     let mut shown = start_id;
     let body_start = frontmatter_body_start(lines);
+    let mut printed_section = false;
     for (idx, line) in lines.iter().enumerate() {
         if idx < body_start {
             continue;
         }
-        if !is_task_line(line) {
+        if is_section_header(line) {
+            if printed_section {
+                println!();
+            }
+            printed_section = true;
+            println!("  {C_BOLD}{}{C_RESET}", line);
+            continue;
+        }
+        if !is_top_level_task_line(line) {
             continue;
         }
 
         shown += 1;
-        print_task_row(shown, line, raw);
+        let progress = subtask_progress_label(lines, idx);
+        print_task_row(shown, line, raw, progress.as_deref());
 
         for description in collect_descriptions(lines, idx) {
             println!(
@@ -1676,31 +2131,48 @@ fn print_numbered_tasks(lines: &[String], start_id: usize, raw: bool) -> usize {
                 description.trim_start_matches("  ")
             );
         }
+        for subtask in collect_subtasks(lines, idx) {
+            let check = if subtask.done { "[x]" } else { "[ ]" };
+            let mut sub_line = format!("- {} {}", check, subtask.text);
+            if let Some(done_at) = subtask.done_at {
+                sub_line.push_str(" ✅ ");
+                sub_line.push_str(&done_at);
+            }
+            println!("      {}", sub_line);
+        }
     }
     shown
 }
 
-fn print_task_row(index: usize, line: &str, raw: bool) {
+fn print_task_row(index: usize, line: &str, raw: bool, progress: Option<&str>) {
     if raw {
+        let suffix = progress.map_or_else(String::new, |p| format!(" {}", p));
         if line.starts_with("- [x]") {
-            println!("  {C_GREEN}{:>2}.{C_RESET} {}", index, line);
+            println!("  {C_GREEN}{:>2}.{C_RESET} {}{}", index, line, suffix);
         } else {
-            println!("  {C_YELLOW}{:>2}.{C_RESET} {}", index, line);
+            println!("  {C_YELLOW}{:>2}.{C_RESET} {}{}", index, line, suffix);
         }
         return;
     }
 
     let Some(parsed) = parse_display_task_line(line) else {
+        let suffix = progress.map_or_else(String::new, |p| format!(" {}", p));
         if line.starts_with("- [x]") {
-            println!("  {C_GREEN}{:>2}.{C_RESET} {}", index, line);
+            println!("  {C_GREEN}{:>2}.{C_RESET} {}{}", index, line, suffix);
         } else {
-            println!("  {C_YELLOW}{:>2}.{C_RESET} {}", index, line);
+            println!("  {C_YELLOW}{:>2}.{C_RESET} {}{}", index, line, suffix);
         }
         return;
     };
 
     let marker = if parsed.done { "✓" } else { "□" };
     let mut left_text = parsed.text.clone();
+    if let Some(label) = progress {
+        left_text.push(' ');
+        left_text.push_str(C_DIM);
+        left_text.push_str(label);
+        left_text.push_str(C_RESET);
+    }
     if parsed.done {
         left_text.push_str(" (done)");
     }
@@ -1815,7 +2287,7 @@ fn today_ymd() -> String {
 }
 
 fn set_current_file(app: &AppPaths, file: &TaskFile) -> io::Result<()> {
-    write_string_atomic(&app.current_file, &task_file_key(file))
+    fs::write(&app.current_file, task_file_key(file))
 }
 
 fn parse_task_file(value: &str) -> Option<TaskFile> {
@@ -2203,6 +2675,40 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     era * 146097 + doe - 719468
 }
 
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = (yoe + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = (mp + if mp < 10 { 3 } else { -9 }) as u32;
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
+fn add_days_to_date(date: &str, days: i64) -> Option<String> {
+    let (y, m, d) = parse_ymd(date)?;
+    let next = days_from_civil(y, m, d) + days;
+    let (ny, nm, nd) = civil_from_days(next);
+    Some(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+fn next_weekday_date(date: &str, target_weekday: i64) -> Option<String> {
+    let (y, m, d) = parse_ymd(date)?;
+    let current_days = days_from_civil(y, m, d);
+    let current_weekday = (current_days + 4).rem_euclid(7);
+    let mut delta = (target_weekday - current_weekday).rem_euclid(7);
+    if delta == 0 {
+        delta = 7;
+    }
+    add_days_to_date(date, delta)
+}
+
 fn alarm_trigger_time(task: &DisplayTaskLine) -> Option<String> {
     let alarm = task.alarm.as_ref()?;
     match alarm {
@@ -2225,8 +2731,33 @@ fn alarm_trigger_time(task: &DisplayTaskLine) -> Option<String> {
 }
 
 fn generate_new_task_id(app: &AppPaths) -> Result<String, String> {
-    let mut taken = collect_taken_task_ids(app)?;
-    generate_unique_task_id(&mut taken)
+    let files = all_task_files(app).map_err(|e| format!("failed to collect files: {e}"))?;
+    let mut taken: HashSet<String> = HashSet::new();
+    for file in files {
+        let path = task_file_path(app, &file);
+        let lines = read_lines(&path)
+            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+        for idx in task_line_indices(&lines) {
+            if let Some(id) = extract_task_id(&lines[idx]) {
+                taken.insert(id);
+            }
+        }
+    }
+
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    for attempt in 0u64..5000 {
+        let candidate = format!(
+            "{:06x}",
+            ((seed.wrapping_add(attempt * 977)) & 0x00ff_ffff) as u32
+        );
+        if !taken.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err("failed to generate unique task id".to_string())
 }
 
 fn selection_files(app: &AppPaths, selection: &DoneSelection) -> Result<Vec<TaskFile>, String> {
@@ -2270,291 +2801,64 @@ fn parse_task_line(line: &str) -> Option<ParsedTaskLine> {
         return None;
     };
 
-    let body = &line[6..];
-    let tokens: Vec<&str> = body.split_whitespace().collect();
-    let mut text_tokens: Vec<String> = Vec::new();
-    let mut tags: Vec<String> = Vec::new();
-    let mut due: Option<String> = None;
-    let mut id: Option<String> = None;
-    let mut recurrence: Option<Recurrence> = None;
-    let mut done_at: Option<String> = None;
-
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let token = tokens[i];
-        if let Some(tag) = token.strip_prefix('#') {
-            if !tag.is_empty() {
-                tags.push(tag.to_string());
-            }
-            i += 1;
-            continue;
+    let mut text = line[6..].to_string();
+    let mut id = None;
+    if let Some(found_id) = extract_task_id(&text) {
+        if let Some((head, _)) = text.rsplit_once(" 🆔 ") {
+            text = head.to_string();
+            id = Some(found_id);
         }
-        if token == "📅" && i + 1 < tokens.len() && is_valid_date(tokens[i + 1]) {
-            due = Some(tokens[i + 1].to_string());
-            i += 2;
-            continue;
-        }
-        if token == "✅" && i + 1 < tokens.len() && is_valid_date(tokens[i + 1]) {
-            done_at = Some(tokens[i + 1].to_string());
-            i += 2;
-            continue;
-        }
-        if token == "🔁" && i + 1 < tokens.len() {
-            if let Some(value) = parse_recurrence_value(tokens[i + 1]) {
-                recurrence = Some(value);
-                i += 2;
-                continue;
-            }
-        }
-        if token == "🆔" && i + 1 < tokens.len() {
-            let raw = tokens[i + 1].to_ascii_lowercase();
-            if raw.len() == 6 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
-                id = Some(raw);
-            }
-            i += 2;
-            continue;
-        }
-        if (token == "⏰" || token == "👤") && i + 1 < tokens.len() {
-            i += 2;
-            continue;
-        }
-        text_tokens.push(token.to_string());
-        i += 1;
     }
+
+    let mut due = None;
+    if let Some((head, tail)) = text.rsplit_once(" 📅 ") {
+        let token = tail.split_whitespace().next().unwrap_or("");
+        if is_valid_date(token) {
+            due = Some(token.to_string());
+            text = head.to_string();
+        }
+    }
+
+    let mut done_at = None;
+    if let Some((head, tail)) = text.rsplit_once(" ✅ ") {
+        let token = tail.split_whitespace().next().unwrap_or("");
+        if is_valid_date(token) {
+            done_at = Some(token.to_string());
+            text = head.to_string();
+        }
+    }
+
+    let mut recurrence = None;
+    if let Some((head, tail)) = text.rsplit_once(" 🔁 ") {
+        let token = tail.split_whitespace().next().unwrap_or("");
+        recurrence = match token {
+            "daily" => Some(Recurrence::Daily),
+            "weekly" => Some(Recurrence::Weekly),
+            "monthly" => Some(Recurrence::Monthly),
+            "weekdays" => Some(Recurrence::Weekdays),
+            _ => None,
+        };
+        if recurrence.is_some() {
+            text = head.to_string();
+        }
+    }
+
+    let tags = text
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix('#'))
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| tag.to_string())
+        .collect();
 
     Some(ParsedTaskLine {
         done,
-        text: text_tokens.join(" ").trim().to_string(),
+        text: text.trim().to_string(),
         tags,
         due,
         id,
         recurrence,
         done_at,
     })
-}
-
-fn parse_recurrence_value(value: &str) -> Option<Recurrence> {
-    match value {
-        "daily" => Some(Recurrence::Daily),
-        "weekly" => Some(Recurrence::Weekly),
-        "monthly" => Some(Recurrence::Monthly),
-        "weekdays" => Some(Recurrence::Weekdays),
-        _ => None,
-    }
-}
-
-fn recurrence_value_str(value: Recurrence) -> &'static str {
-    match value {
-        Recurrence::Daily => "daily",
-        Recurrence::Weekly => "weekly",
-        Recurrence::Monthly => "monthly",
-        Recurrence::Weekdays => "weekdays",
-    }
-}
-
-fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
-    haystack.to_lowercase().contains(needle_lower)
-}
-
-fn next_recurring_due(completed_on: &str, recurrence: Recurrence) -> Option<String> {
-    match recurrence {
-        Recurrence::Daily => add_days(completed_on, 1),
-        Recurrence::Weekly => add_days(completed_on, 7),
-        Recurrence::Monthly => add_month(completed_on),
-        Recurrence::Weekdays => next_weekday(completed_on),
-    }
-}
-
-fn add_days(date: &str, days: i64) -> Option<String> {
-    let (y, m, d) = parse_ymd(date)?;
-    let base = days_from_civil(y, m, d);
-    let (ny, nm, nd) = civil_from_days(base + days);
-    Some(format!("{ny:04}-{nm:02}-{nd:02}"))
-}
-
-fn add_month(date: &str) -> Option<String> {
-    let (mut y, mut m, d) = parse_ymd(date)?;
-    m += 1;
-    if m > 12 {
-        m = 1;
-        y += 1;
-    }
-    let mdays = days_in_month(y, m);
-    let day = d.min(mdays);
-    Some(format!("{y:04}-{m:02}-{day:02}"))
-}
-
-fn next_weekday(date: &str) -> Option<String> {
-    let mut n = add_days(date, 1)?;
-    loop {
-        let (y, m, d) = parse_ymd(&n)?;
-        let weekday = ((days_from_civil(y, m, d) + 4).rem_euclid(7)) as i32;
-        if (1..=5).contains(&weekday) {
-            return Some(n);
-        }
-        n = add_days(&n, 1)?;
-    }
-}
-
-fn days_in_month(year: i32, month: u32) -> u32 {
-    match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap_year(year) {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 31,
-    }
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
-fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    (year as i32, m as u32, d as u32)
-}
-
-fn collect_taken_task_ids(app: &AppPaths) -> Result<HashSet<String>, String> {
-    let files = all_task_files(app).map_err(|e| format!("failed to collect files: {e}"))?;
-    let mut taken: HashSet<String> = HashSet::new();
-    for file in files {
-        let path = task_file_path(app, &file);
-        let lines = read_lines(&path)
-            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
-        for idx in task_line_indices(&lines) {
-            if let Some(id) = extract_task_id(&lines[idx]) {
-                taken.insert(id);
-            }
-        }
-    }
-    Ok(taken)
-}
-
-fn generate_unique_task_id(taken: &mut HashSet<String>) -> Result<String, String> {
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    for attempt in 0u64..5000 {
-        let candidate = format!(
-            "{:06x}",
-            ((seed.wrapping_add(attempt * 977)) & 0x00ff_ffff) as u32
-        );
-        if !taken.contains(&candidate) {
-            taken.insert(candidate.clone());
-            return Ok(candidate);
-        }
-    }
-    Err("failed to generate unique task id".to_string())
-}
-
-fn recur_signature(text: &str, tags: &[String], recurrence: Recurrence, due: &str) -> String {
-    let mut tags = tags.to_vec();
-    tags.sort();
-    format!(
-        "{}|{}|{}|{}",
-        text.trim(),
-        tags.join(","),
-        recurrence_value_str(recurrence),
-        due
-    )
-}
-
-fn run_recur(app: &AppPaths, print_each: bool) -> Result<usize, String> {
-    let today = today_ymd();
-    let files = all_task_files(app).map_err(|e| format!("failed to read files: {e}"))?;
-    let mut created_total = 0usize;
-    let mut taken_ids = collect_taken_task_ids(app)?;
-
-    for file in files {
-        let path = task_file_path(app, &file);
-        let lines = read_lines(&path)
-            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
-        let mut existing_open: HashSet<String> = HashSet::new();
-        let mut to_append: Vec<String> = Vec::new();
-
-        for idx in task_line_indices(&lines) {
-            let line = &lines[idx];
-            let Some(parsed) = parse_task_line(line) else {
-                continue;
-            };
-            let (Some(recurrence), Some(due)) = (parsed.recurrence, parsed.due.as_ref()) else {
-                continue;
-            };
-            if !parsed.done {
-                existing_open.insert(recur_signature(&parsed.text, &parsed.tags, recurrence, due));
-            }
-        }
-
-        for idx in task_line_indices(&lines) {
-            let line = &lines[idx];
-            let Some(parsed) = parse_task_line(line) else {
-                continue;
-            };
-            if !parsed.done {
-                continue;
-            }
-            let (Some(recurrence), Some(done_at)) = (parsed.recurrence, parsed.done_at.as_ref())
-            else {
-                continue;
-            };
-            let Some(next_due) = next_recurring_due(done_at, recurrence) else {
-                continue;
-            };
-            if next_due.as_str() > today.as_str() {
-                continue;
-            }
-
-            let signature = recur_signature(&parsed.text, &parsed.tags, recurrence, &next_due);
-            if existing_open.contains(&signature) {
-                continue;
-            }
-
-            let text = parsed.text.clone();
-            let tags = parsed.tags.clone();
-            let new_id = generate_unique_task_id(&mut taken_ids)?;
-            let mut new_line = format!("- [ ] {}", text);
-            for tag in tags {
-                new_line.push(' ');
-                new_line.push('#');
-                new_line.push_str(&tag);
-            }
-            new_line.push_str(" 📅 ");
-            new_line.push_str(&next_due);
-            new_line.push_str(" 🔁 ");
-            new_line.push_str(recurrence_value_str(recurrence));
-            new_line.push_str(" 🆔 ");
-            new_line.push_str(&new_id);
-            to_append.push(new_line);
-            existing_open.insert(signature);
-            created_total += 1;
-            if print_each {
-                println!("Created recurring task: [{}] → {}", text, next_due);
-            }
-        }
-
-        if !to_append.is_empty() {
-            append_lines(&path, &to_append)
-                .map_err(|e| format!("failed to write {}: {e}", task_file_filename(&file)))?;
-        }
-    }
-
-    Ok(created_total)
 }
 
 fn collect_tasks_for_file(app: &AppPaths, file: &TaskFile) -> Result<Vec<TaskJsonRecord>, String> {
@@ -2575,6 +2879,14 @@ fn collect_tasks_for_file(app: &AppPaths, file: &TaskFile) -> Result<Vec<TaskJso
                 description: collect_descriptions(&lines, idx)
                     .into_iter()
                     .map(|d| d.trim_start_matches("  ").to_string())
+                    .collect(),
+                subtasks: collect_subtasks(&lines, idx)
+                    .into_iter()
+                    .map(|s| SubtaskJsonRecord {
+                        done: s.done,
+                        text: s.text,
+                        done_at: s.done_at,
+                    })
                     .collect(),
             });
         }
@@ -2809,8 +3121,7 @@ fn write_app_config(app: &AppPaths, cfg: &AppConfig) -> Result<(), String> {
         json_string(&cfg.watch.handler),
         cfg.watch.interval.max(1)
     );
-    write_string_atomic(&app.config_file, &content)
-        .map_err(|e| format!("failed to write config: {e}"))
+    fs::write(&app.config_file, content).map_err(|e| format!("failed to write config: {e}"))
 }
 
 fn set_config_value(app: &AppPaths, key: &str, value: ConfigValue) -> Result<(), String> {
@@ -2873,9 +3184,27 @@ fn print_tasks_json(tasks: &[TaskJsonRecord]) {
         println!("    \"due\": {},", due_json);
         println!("    \"file\": {},", json_string(&task.file));
         println!(
-            "    \"description\": {}",
+            "    \"description\": {},",
             json_string_array(&task.description)
         );
+        println!("    \"subtasks\": [");
+        for (sub_idx, subtask) in task.subtasks.iter().enumerate() {
+            let sub_comma = if sub_idx + 1 == task.subtasks.len() {
+                ""
+            } else {
+                ","
+            };
+            let done_at_json = subtask
+                .done_at
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |v| json_string(v));
+            println!("      {{");
+            println!("        \"done\": {},", subtask.done);
+            println!("        \"text\": {},", json_string(&subtask.text));
+            println!("        \"done_at\": {}", done_at_json);
+            println!("      }}{}", sub_comma);
+        }
+        println!("    ]");
         println!("  }}{}", comma);
     }
     println!("]");
@@ -2910,10 +3239,14 @@ fn help_text() -> &'static str {
     "dodo - local markdown task manager\n\
 \n\
 Commands:\n\
-  dodo add \"Task description\" [--file today|inbox|waiting|someday|projects/<name>] [--due DATE] [--tag TAG]\n\
+  dodo add \"Task description\" [--file today|inbox|waiting|someday|projects/<name>] [--section NAME] [--due DATE] [--tag TAG]\n\
   dodo list [--file today|inbox|projects|projects/<name>|all] [--tag TAG] [--raw] [--json]\n\
   dodo done <id> --file inbox|today|waiting|someday|projects/<name>|all\n\
   dodo done --id <6-hex> [--file inbox|today|waiting|someday|projects/<name>|all]\n\
+  dodo subtask add <parent-id> \"text\"\n\
+  dodo subtask done <parent-id> <sub-num>\n\
+  dodo subtask list <parent-id>\n\
+  dodo section add \"Name\" --file today|inbox|waiting|someday|projects/<name>\n\
   dodo delete <id> --file inbox|today|waiting|someday|projects/<name>\n\
   dodo delete --id <6-hex> [--file inbox|today|waiting|someday|projects/<name>|all]\n\
   dodo clean --file inbox|today|waiting|someday|projects/<name>|all\n\
@@ -2931,9 +3264,7 @@ Commands:\n\
   dodo config get watch.handler|watch.interval\n\
   dodo config set watch.handler|watch.interval <value>\n\
   dodo status [--json]\n\
-  dodo overdue [--json]\n\
-  dodo recur\n\
-  dodo search [--json] \"query\"\n"
+  dodo overdue [--json]\n"
 }
 
 fn print_help() {
