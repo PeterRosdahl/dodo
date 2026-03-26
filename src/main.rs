@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
 use std::process::Command;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -50,6 +50,8 @@ struct ParsedTaskLine {
     tags: Vec<String>,
     due: Option<String>,
     id: Option<String>,
+    recurrence: Option<Recurrence>,
+    done_at: Option<String>,
 }
 
 struct DisplayTaskLine {
@@ -86,6 +88,14 @@ struct AppConfig {
 enum ConfigValue {
     Text(String),
     Number(u64),
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum Recurrence {
+    Daily,
+    Weekly,
+    Monthly,
+    Weekdays,
 }
 
 struct TaskJsonRecord {
@@ -156,6 +166,8 @@ fn run() -> Result<(), String> {
         "move" => cmd_move(&app, &args),
         "status" => cmd_status(&app, &args),
         "overdue" => cmd_overdue(&app, &args),
+        "recur" => cmd_recur(&app, &args),
+        "search" => cmd_search(&app, &args),
         "alarms" => cmd_alarms(&app, &args),
         "watch" => cmd_watch(&app, &args),
         "config" => cmd_config(&app, &args),
@@ -197,7 +209,7 @@ fn bootstrap_paths() -> io::Result<AppPaths> {
 
     let current = root.join(".current");
     if !current.exists() {
-        fs::write(&current, "inbox")?;
+        write_string_atomic(&current, "inbox")?;
     }
 
     Ok(AppPaths {
@@ -1105,6 +1117,227 @@ fn cmd_overdue(app: &AppPaths, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_recur(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: dodo recur".to_string());
+    }
+    run_recur(app, true).map(|_| ())
+}
+
+fn cmd_search(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: dodo search [--json] \"query\"".to_string());
+    }
+    let mut json = false;
+    let mut parts: Vec<&str> = Vec::new();
+    for arg in args {
+        if arg == "--json" {
+            json = true;
+        } else {
+            parts.push(arg);
+        }
+    }
+    if parts.is_empty() {
+        return Err("usage: dodo search [--json] \"query\"".to_string());
+    }
+    let query = parts.join(" ");
+    let needle = query.to_lowercase();
+
+    let mut json_results: Vec<TaskJsonRecord> = Vec::new();
+    let files = all_task_files(app).map_err(|e| format!("failed to read files: {e}"))?;
+    let mut printed_any = false;
+    for file in files {
+        let path = task_file_path(app, &file);
+        let lines = read_lines(&path)
+            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+        let mut matched: Vec<(String, Vec<String>)> = Vec::new();
+        for idx in task_line_indices(&lines) {
+            let line = &lines[idx];
+            let descriptions = collect_descriptions(&lines, idx);
+            let parsed = parse_task_line(line);
+            let task_text = parsed
+                .as_ref()
+                .map_or_else(|| line.clone(), |p| p.text.clone());
+            let task_hit = contains_case_insensitive(&task_text, &needle);
+            let desc_hit = descriptions
+                .iter()
+                .any(|d| contains_case_insensitive(d.trim_start_matches("  "), &needle));
+            if !task_hit && !desc_hit {
+                continue;
+            }
+
+            if json {
+                if let Some(parsed) = parsed {
+                    json_results.push(TaskJsonRecord {
+                        id: parsed.id,
+                        done: parsed.done,
+                        text: parsed.text,
+                        tags: parsed.tags,
+                        due: parsed.due,
+                        file: task_file_filename(&file),
+                        description: descriptions
+                            .iter()
+                            .map(|d| d.trim_start_matches("  ").to_string())
+                            .collect(),
+                    });
+                } else {
+                    json_results.push(TaskJsonRecord {
+                        id: None,
+                        done: line.starts_with("- [x] "),
+                        text: line.clone(),
+                        tags: Vec::new(),
+                        due: extract_due_date(line),
+                        file: task_file_filename(&file),
+                        description: descriptions
+                            .iter()
+                            .map(|d| d.trim_start_matches("  ").to_string())
+                            .collect(),
+                    });
+                }
+            } else {
+                matched.push((line.clone(), descriptions));
+            }
+        }
+
+        if json || matched.is_empty() {
+            continue;
+        }
+        if printed_any {
+            println!();
+        }
+        printed_any = true;
+        println!(
+            "{C_BOLD}{C_CYAN}{} ({}){C_RESET}",
+            task_file_label(&file),
+            task_file_filename(&file)
+        );
+        for (i, (line, descriptions)) in matched.iter().enumerate() {
+            print_task_row(i + 1, line, false);
+            for description in descriptions {
+                println!(
+                    "      {C_DIM}{}{C_RESET}",
+                    description.trim_start_matches("  ")
+                );
+            }
+        }
+    }
+
+    if json {
+        print_tasks_json(&json_results);
+    } else if !printed_any {
+        println!("  {C_BLUE}(no matches){C_RESET}");
+    }
+    Ok(())
+}
+
+fn cmd_alarms(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: dodo alarms".to_string());
+    }
+    let now = now_ymd_hm();
+    let alarms: Vec<AlarmRecord> = collect_all_alarms(app)?
+        .into_iter()
+        .filter(|a| a.when >= now)
+        .collect();
+    println!("{C_BOLD}{C_CYAN}Alarms{C_RESET}");
+    if alarms.is_empty() {
+        println!("  {C_BLUE}(none){C_RESET}");
+        return Ok(());
+    }
+    for (i, alarm) in alarms.iter().enumerate() {
+        let id = i + 1;
+        let marker = if alarm.line.starts_with("- [x] ") {
+            "✓"
+        } else {
+            "□"
+        };
+        let parsed = parse_display_task_line(&alarm.line);
+        let text = parsed
+            .as_ref()
+            .map_or_else(|| alarm.line.clone(), |p| p.text.clone());
+        println!(
+            "  {:>2}. {} {}  {}",
+            id,
+            marker,
+            text,
+            alarm.when
+        );
+        println!(
+            "      {C_DIM}{}{C_RESET}",
+            task_file_filename(&alarm.file)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_watch(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: dodo watch".to_string());
+    }
+    let created = run_recur(app, true)?;
+    if created > 0 {
+        println!("Processed recurring tasks: {created}");
+    }
+    let config = read_app_config(app)?;
+    loop {
+        let now = now_ymd_hm();
+        let pending = collect_all_alarms(app)?;
+        if let Some(alarm) = pending.into_iter().find(|item| item.when <= now) {
+            trigger_alarm_handler(&config.watch.handler, &alarm)?;
+            return Ok(());
+        }
+        thread::sleep(Duration::from_secs(config.watch.interval.max(1)));
+    }
+}
+
+fn cmd_config(app: &AppPaths, args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("usage: dodo config get <key> | dodo config set <key> <value>".to_string());
+    }
+    match args[0].as_str() {
+        "get" => {
+            if args.len() != 2 {
+                return Err("usage: dodo config get watch.handler|watch.interval".to_string());
+            }
+            let cfg = read_app_config(app)?;
+            match args[1].as_str() {
+                "watch.handler" => println!("{}", cfg.watch.handler),
+                "watch.interval" => println!("{}", cfg.watch.interval),
+                _ => {
+                    return Err(
+                        "config key must be watch.handler or watch.interval".to_string()
+                    )
+                }
+            }
+            Ok(())
+        }
+        "set" => {
+            if args.len() != 3 {
+                return Err(
+                    "usage: dodo config set watch.handler|watch.interval <value>".to_string(),
+                );
+            }
+            let value = match args[1].as_str() {
+                "watch.handler" => ConfigValue::Text(args[2].clone()),
+                "watch.interval" => {
+                    let interval = args[2]
+                        .parse::<u64>()
+                        .map_err(|_| "watch.interval must be a positive integer".to_string())?;
+                    if interval == 0 {
+                        return Err("watch.interval must be >= 1".to_string());
+                    }
+                    ConfigValue::Number(interval)
+                }
+                _ => return Err("config key must be watch.handler or watch.interval".to_string()),
+            };
+            set_config_value(app, &args[1], value)?;
+            println!("{} = {}", args[1], args[2]);
+            Ok(())
+        }
+        _ => Err("usage: dodo config get <key> | dodo config set <key> <value>".to_string()),
+    }
+}
+
 fn print_tasks_for(app: &AppPaths, file: CoreFile, raw: bool) -> Result<(), String> {
     let path = app.root.join(file.filename());
     let lines =
@@ -1218,11 +1451,7 @@ fn print_tasks_by_tag(app: &AppPaths, tag: &str, raw: bool) -> Result<(), String
         );
         for (i, (line, descriptions)) in matched.iter().enumerate() {
             let id = i + 1;
-            if line.starts_with("- [x]") {
-                println!("  {C_GREEN}{:>2}.{C_RESET} {}", id, line);
-            } else {
-                println!("  {C_YELLOW}{:>2}.{C_RESET} {}", id, line);
-            }
+            print_task_row(id, line, raw);
             for description in descriptions {
                 println!(
                     "      {C_DIM}{}{C_RESET}",
@@ -1327,7 +1556,7 @@ fn remove_completed_tasks(lines: &[String]) -> (Vec<String>, usize) {
     (kept, removed_count)
 }
 
-fn print_numbered_tasks(lines: &[String], start_id: usize) -> usize {
+fn print_numbered_tasks(lines: &[String], start_id: usize, raw: bool) -> usize {
     let mut shown = start_id;
     let body_start = frontmatter_body_start(lines);
     for (idx, line) in lines.iter().enumerate() {
@@ -1339,11 +1568,7 @@ fn print_numbered_tasks(lines: &[String], start_id: usize) -> usize {
         }
 
         shown += 1;
-        if line.starts_with("- [x]") {
-            println!("  {C_GREEN}{:>2}.{C_RESET} {}", shown, line);
-        } else {
-            println!("  {C_YELLOW}{:>2}.{C_RESET} {}", shown, line);
-        }
+        print_task_row(shown, line, raw);
 
         for description in collect_descriptions(lines, idx) {
             println!(
@@ -1353,6 +1578,105 @@ fn print_numbered_tasks(lines: &[String], start_id: usize) -> usize {
         }
     }
     shown
+}
+
+fn print_task_row(index: usize, line: &str, raw: bool) {
+    if raw {
+        if line.starts_with("- [x]") {
+            println!("  {C_GREEN}{:>2}.{C_RESET} {}", index, line);
+        } else {
+            println!("  {C_YELLOW}{:>2}.{C_RESET} {}", index, line);
+        }
+        return;
+    }
+
+    let Some(parsed) = parse_display_task_line(line) else {
+        if line.starts_with("- [x]") {
+            println!("  {C_GREEN}{:>2}.{C_RESET} {}", index, line);
+        } else {
+            println!("  {C_YELLOW}{:>2}.{C_RESET} {}", index, line);
+        }
+        return;
+    };
+
+    let marker = if parsed.done { "✓" } else { "□" };
+    let mut left_text = parsed.text.clone();
+    if parsed.done {
+        left_text.push_str(" (done)");
+    }
+    if !parsed.tags.is_empty() {
+        left_text.push(' ');
+        left_text.push_str(C_DIM);
+        for (i, tag) in parsed.tags.iter().enumerate() {
+            if i > 0 {
+                left_text.push(' ');
+            }
+            left_text.push('#');
+            left_text.push_str(tag);
+        }
+        left_text.push_str(C_RESET);
+    }
+
+    let right = task_right_side(&parsed);
+    let left = format!("  {:>2}. {} {}", index, marker, left_text);
+    if right.is_empty() {
+        println!("{left}");
+    } else {
+        let target_col = 48usize;
+        let left_len = printable_len(&left);
+        let pad = if left_len >= target_col {
+            1
+        } else {
+            target_col - left_len
+        };
+        println!("{left}{}{right}", " ".repeat(pad));
+    }
+}
+
+fn task_right_side(task: &DisplayTaskLine) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if task.done {
+        if let Some(done_at) = &task.done_at {
+            parts.push(human_date_label(done_at));
+        } else if let Some(date) = task
+            .due
+            .as_deref()
+            .or_else(|| alarm_date_part(task.alarm.as_ref()))
+        {
+            parts.push(human_date_label(date));
+        }
+    } else if let Some(date) = task
+        .due
+        .as_deref()
+        .or_else(|| alarm_date_part(task.alarm.as_ref()))
+    {
+        parts.push(human_date_label(date));
+    }
+
+    if let Some(time) = alarm_time_part(task.alarm.as_ref()) {
+        parts.push(time.to_string());
+    }
+
+    parts.join(" ")
+}
+
+fn printable_len(value: &str) -> usize {
+    let mut out = 0usize;
+    let mut in_escape = false;
+    for ch in value.chars() {
+        if in_escape {
+            if ch == 'm' {
+                in_escape = false;
+            }
+            continue;
+        }
+        if ch == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+        out += 1;
+    }
+    out
 }
 
 fn is_open_task_line(line: &str) -> bool {
@@ -1617,6 +1941,189 @@ fn extract_task_id(line: &str) -> Option<String> {
     }
 }
 
+fn parse_display_task_line(line: &str) -> Option<DisplayTaskLine> {
+    let (done, body) = if let Some(rest) = line.strip_prefix("- [x] ") {
+        (true, rest)
+    } else if let Some(rest) = line.strip_prefix("- [ ] ") {
+        (false, rest)
+    } else {
+        return None;
+    };
+
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let mut text_tokens: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut due: Option<String> = None;
+    let mut alarm: Option<AlarmSpec> = None;
+    let mut done_at: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if let Some(tag) = token.strip_prefix('#') {
+            if !tag.is_empty() {
+                tags.push(tag.to_string());
+            }
+            i += 1;
+            continue;
+        }
+
+        if token == "📅" && i + 1 < tokens.len() && is_valid_date(tokens[i + 1]) {
+            due = Some(tokens[i + 1].to_string());
+            i += 2;
+            continue;
+        }
+        if token == "⏰" && i + 1 < tokens.len() {
+            let value = tokens[i + 1];
+            if is_valid_hhmm(value) {
+                alarm = Some(AlarmSpec::Time(value.to_string()));
+                i += 2;
+                continue;
+            }
+            if is_valid_datetime(value) {
+                alarm = Some(AlarmSpec::DateTime(value.to_string()));
+                i += 2;
+                continue;
+            }
+        }
+        if token == "✅" && i + 1 < tokens.len() && is_valid_date(tokens[i + 1]) {
+            done_at = Some(tokens[i + 1].to_string());
+            i += 2;
+            continue;
+        }
+        if token == "🆔" && i + 1 < tokens.len() {
+            i += 2;
+            continue;
+        }
+        if (token == "🔁" || token == "👤") && i + 1 < tokens.len() {
+            i += 2;
+            continue;
+        }
+
+        text_tokens.push(token.to_string());
+        i += 1;
+    }
+
+    Some(DisplayTaskLine {
+        done,
+        text: text_tokens.join(" ").trim().to_string(),
+        tags,
+        due,
+        alarm,
+        done_at,
+    })
+}
+
+fn alarm_date_part(alarm: Option<&AlarmSpec>) -> Option<&str> {
+    match alarm {
+        Some(AlarmSpec::DateTime(value)) => value.split_once('T').map(|(d, _)| d),
+        _ => None,
+    }
+}
+
+fn alarm_time_part(alarm: Option<&AlarmSpec>) -> Option<&str> {
+    match alarm {
+        Some(AlarmSpec::Time(value)) => Some(value.as_str()),
+        Some(AlarmSpec::DateTime(value)) => value.split_once('T').map(|(_, t)| t),
+        None => None,
+    }
+}
+
+fn is_valid_hhmm(value: &str) -> bool {
+    if value.len() != 5 {
+        return false;
+    }
+    let b = value.as_bytes();
+    if b[2] != b':' {
+        return false;
+    }
+    if !b[0..2].iter().all(u8::is_ascii_digit) || !b[3..5].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let hh = value[0..2].parse::<u32>().ok();
+    let mm = value[3..5].parse::<u32>().ok();
+    matches!(hh, Some(h) if h < 24) && matches!(mm, Some(m) if m < 60)
+}
+
+fn is_valid_datetime(value: &str) -> bool {
+    let Some((date, time)) = value.split_once('T') else {
+        return false;
+    };
+    is_valid_date(date) && is_valid_hhmm(time)
+}
+
+fn human_date_label(date: &str) -> String {
+    let Some((y, m, d)) = parse_ymd(date) else {
+        return date.to_string();
+    };
+    let Some((ty, tm, td)) = parse_ymd(&today_ymd()) else {
+        return date.to_string();
+    };
+    let diff = days_from_civil(y, m, d) - days_from_civil(ty, tm, td);
+    if diff == 0 {
+        return "idag".to_string();
+    }
+    if diff == 1 {
+        return "imorgon".to_string();
+    }
+    if diff == -1 {
+        return "igår".to_string();
+    }
+
+    let weekdays = ["sön", "mån", "tis", "ons", "tor", "fre", "lör"];
+    let months = [
+        "jan", "feb", "mar", "apr", "maj", "jun", "jul", "aug", "sep", "okt", "nov", "dec",
+    ];
+    let weekday_idx = ((days_from_civil(y, m, d) + 4).rem_euclid(7)) as usize;
+    let month_idx = (m.saturating_sub(1) as usize).min(11);
+    format!("{} {} {}", weekdays[weekday_idx], d, months[month_idx])
+}
+
+fn parse_ymd(value: &str) -> Option<(i32, u32, u32)> {
+    if !is_valid_date(value) {
+        return None;
+    }
+    let year = value[0..4].parse::<i32>().ok()?;
+    let month = value[5..7].parse::<u32>().ok()?;
+    let day = value[8..10].parse::<u32>().ok()?;
+    if (1..=12).contains(&month) && (1..=31).contains(&day) {
+        Some((year, month, day))
+    } else {
+        None
+    }
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m = month as i64;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn alarm_trigger_time(task: &DisplayTaskLine) -> Option<String> {
+    let alarm = task.alarm.as_ref()?;
+    match alarm {
+        AlarmSpec::DateTime(value) => {
+            if is_valid_datetime(value) {
+                Some(value.clone())
+            } else {
+                None
+            }
+        }
+        AlarmSpec::Time(hhmm) => {
+            let date = task.due.clone().unwrap_or_else(today_ymd);
+            if is_valid_date(&date) && is_valid_hhmm(hhmm) {
+                Some(format!("{date}T{hhmm}"))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn generate_new_task_id(app: &AppPaths) -> Result<String, String> {
     let files = all_task_files(app).map_err(|e| format!("failed to collect files: {e}"))?;
     let mut taken: HashSet<String> = HashSet::new();
@@ -1788,6 +2295,205 @@ fn tasks_for_list_selection(
     }
 }
 
+fn collect_all_alarms(app: &AppPaths) -> Result<Vec<AlarmRecord>, String> {
+    let files = all_task_files(app).map_err(|e| format!("failed to read files: {e}"))?;
+    let mut out: Vec<AlarmRecord> = Vec::new();
+    for file in files {
+        let path = task_file_path(app, &file);
+        let lines = read_lines(&path)
+            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+        for idx in task_line_indices(&lines) {
+            let line = &lines[idx];
+            let Some(parsed) = parse_display_task_line(line) else {
+                continue;
+            };
+            if parsed.done {
+                continue;
+            }
+            let Some(when) = alarm_trigger_time(&parsed) else {
+                continue;
+            };
+            out.push(AlarmRecord {
+                when,
+                file: file.clone(),
+                line: line.clone(),
+                descriptions: collect_descriptions(&lines, idx)
+                    .into_iter()
+                    .map(|d| d.trim_start_matches("  ").to_string())
+                    .collect(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.when.cmp(&b.when));
+    Ok(out)
+}
+
+fn now_ymd_hm() -> String {
+    match Command::new("date").arg("+%Y-%m-%dT%H:%M").output() {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => "1970-01-01T00:00".to_string(),
+    }
+}
+
+fn trigger_alarm_handler(handler: &str, alarm: &AlarmRecord) -> Result<(), String> {
+    if handler == "stdout" {
+        print_alarm_event_json(alarm);
+        return Ok(());
+    }
+    if let Some(command) = handler.strip_prefix("exec:") {
+        return run_exec_handler(command, alarm);
+    }
+    if let Some(url) = handler.strip_prefix("webhook:") {
+        return run_webhook_handler(url, alarm);
+    }
+    Err("watch.handler must be stdout, exec:<path>, or webhook:<url>".to_string())
+}
+
+fn print_alarm_event_json(alarm: &AlarmRecord) {
+    let parsed = parse_display_task_line(&alarm.line);
+    let done = parsed.as_ref().is_some_and(|p| p.done);
+    let text = parsed
+        .as_ref()
+        .map_or_else(|| alarm.line.clone(), |p| p.text.clone());
+    let tags = parsed.map_or_else(Vec::new, |p| p.tags);
+    let due = parse_display_task_line(&alarm.line).and_then(|p| p.due);
+    let payload = format!(
+        "{{\"event\":\"alarm\",\"task\":{{\"done\":{},\"text\":{},\"tags\":{},\"due\":{},\"alarm\":{},\"file\":{},\"description\":{}}}}}",
+        done,
+        json_string(&text),
+        json_string_array(&tags),
+        due.as_ref()
+            .map_or_else(|| "null".to_string(), |v| json_string(v)),
+        json_string(&alarm.when),
+        json_string(&task_file_filename(&alarm.file)),
+        json_string_array(&alarm.descriptions)
+    );
+    println!("{payload}");
+}
+
+fn run_exec_handler(command: &str, alarm: &AlarmRecord) -> Result<(), String> {
+    let expanded = expand_tilde(command);
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&expanded)
+        .env("DODO_EVENT", "alarm")
+        .env("DODO_ALARM_WHEN", &alarm.when)
+        .env("DODO_TASK_FILE", task_file_filename(&alarm.file))
+        .env("DODO_TASK_LINE", &alarm.line)
+        .output()
+        .map_err(|e| format!("failed to run exec handler: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "exec handler failed with status {}",
+            output.status.code().unwrap_or(1)
+        ))
+    }
+}
+
+fn run_webhook_handler(url: &str, alarm: &AlarmRecord) -> Result<(), String> {
+    let payload = format!(
+        "{{\"event\":\"alarm\",\"task\":{{\"line\":{},\"file\":{},\"when\":{}}}}}",
+        json_string(&alarm.line),
+        json_string(&task_file_filename(&alarm.file)),
+        json_string(&alarm.when)
+    );
+    let status = Command::new("curl")
+        .arg("-fsS")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-d")
+        .arg(payload)
+        .arg(url)
+        .status()
+        .map_err(|e| format!("failed to run webhook handler: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("webhook handler failed with status {:?}", status.code()))
+    }
+}
+
+fn expand_tilde(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Ok(home) = env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    value.to_string()
+}
+
+fn default_config() -> AppConfig {
+    AppConfig {
+        watch: WatchConfig {
+            handler: "stdout".to_string(),
+            interval: 60,
+        },
+    }
+}
+
+fn read_app_config(app: &AppPaths) -> Result<AppConfig, String> {
+    if !app.config_file.exists() {
+        return Ok(default_config());
+    }
+    let content = fs::read_to_string(&app.config_file)
+        .map_err(|e| format!("failed to read config: {e}"))?;
+    let mut cfg = default_config();
+    let mut in_watch = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_watch = line == "[watch]";
+            continue;
+        }
+        if !in_watch {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let value = v.trim().trim_matches('"');
+        match key {
+            "handler" => cfg.watch.handler = value.to_string(),
+            "interval" => {
+                if let Ok(parsed) = value.parse::<u64>() {
+                    cfg.watch.interval = parsed.max(1);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(cfg)
+}
+
+fn write_app_config(app: &AppPaths, cfg: &AppConfig) -> Result<(), String> {
+    let content = format!(
+        "[watch]\nhandler = {}\ninterval = {}\n",
+        json_string(&cfg.watch.handler),
+        cfg.watch.interval.max(1)
+    );
+    fs::write(&app.config_file, content).map_err(|e| format!("failed to write config: {e}"))
+}
+
+fn set_config_value(app: &AppPaths, key: &str, value: ConfigValue) -> Result<(), String> {
+    let mut cfg = read_app_config(app)?;
+    match (key, value) {
+        ("watch.handler", ConfigValue::Text(v)) => cfg.watch.handler = v,
+        ("watch.interval", ConfigValue::Number(v)) => cfg.watch.interval = v.max(1),
+        _ => return Err("unsupported config key".to_string()),
+    }
+    write_app_config(app, &cfg)
+}
+
 fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -1876,7 +2582,7 @@ fn help_text() -> &'static str {
 \n\
 Commands:\n\
   dodo add \"Task description\" [--file today|inbox|waiting|someday|projects/<name>] [--due DATE] [--tag TAG]\n\
-  dodo list [--file today|inbox|projects|projects/<name>|all] [--tag TAG] [--json]\n\
+  dodo list [--file today|inbox|projects|projects/<name>|all] [--tag TAG] [--raw] [--json]\n\
   dodo done <id> --file inbox|today|waiting|someday|projects/<name>|all\n\
   dodo done --id <6-hex> [--file inbox|today|waiting|someday|projects/<name>|all]\n\
   dodo delete <id> --file inbox|today|waiting|someday|projects/<name>\n\
@@ -1891,6 +2597,10 @@ Commands:\n\
   dodo move <id> <file>\n\
   dodo move --id <6-hex> <file>\n\
   dodo meta --file inbox|today|waiting|someday|projects/<name> [--set \"key: value\"]\n\
+  dodo alarms\n\
+  dodo watch\n\
+  dodo config get watch.handler|watch.interval\n\
+  dodo config set watch.handler|watch.interval <value>\n\
   dodo status [--json]\n\
   dodo overdue [--json]\n"
 }
