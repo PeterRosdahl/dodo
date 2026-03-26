@@ -1470,16 +1470,19 @@ fn print_tasks_by_tag(app: &AppPaths, tag: &str, raw: bool) -> Result<(), String
 }
 
 fn append_line(path: &Path, line: &str) -> io::Result<()> {
-    let mut f = OpenOptions::new().append(true).create(true).open(path)?;
-    writeln!(f, "{}", line)
+    with_file_lock(path, |lock_path| {
+        let mut lines = read_lines_or_empty(path)?;
+        lines.push(line.to_string());
+        write_lines_atomic(path, lock_path, &lines)
+    })
 }
 
 fn append_lines(path: &Path, lines: &[String]) -> io::Result<()> {
-    let mut f = OpenOptions::new().append(true).create(true).open(path)?;
-    for line in lines {
-        writeln!(f, "{}", line)?;
-    }
-    Ok(())
+    with_file_lock(path, |lock_path| {
+        let mut all = read_lines_or_empty(path)?;
+        all.extend(lines.iter().cloned());
+        write_lines_atomic(path, lock_path, &all)
+    })
 }
 
 fn read_lines(path: &Path) -> io::Result<Vec<String>> {
@@ -1488,11 +1491,108 @@ fn read_lines(path: &Path) -> io::Result<Vec<String>> {
 }
 
 fn write_lines(path: &Path, lines: &[String]) -> io::Result<()> {
+    with_file_lock(path, |lock_path| write_lines_atomic(path, lock_path, lines))
+}
+
+fn read_lines_or_empty(path: &Path) -> io::Result<Vec<String>> {
+    match read_lines(path) {
+        Ok(lines) => Ok(lines),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn with_file_lock<T, F>(path: &Path, mut action: F) -> io::Result<T>
+where
+    F: FnMut(&Path) -> io::Result<T>,
+{
+    let lock_path = lock_path_for(path);
+    let start = SystemTime::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => break,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                let stale = is_stale_lock(&lock_path)?;
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                let waited = start.elapsed().unwrap_or(Duration::from_secs(0));
+                if waited >= Duration::from_secs(2) {
+                    return Err(io::Error::new(
+                        ErrorKind::WouldBlock,
+                        format!("timed out waiting for lock {}", lock_path.display()),
+                    ));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let result = action(&lock_path);
+    let _ = fs::remove_file(&lock_path);
+    result
+}
+
+fn is_stale_lock(lock_path: &Path) -> io::Result<bool> {
+    let metadata = match fs::metadata(lock_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let modified = metadata.modified()?;
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::from_secs(0));
+    Ok(age > Duration::from_secs(5))
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    let file = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| ".lock".to_string(), |s| format!(".{s}.lock"));
+    path.with_file_name(file)
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let file = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| ".tmp".to_string(), |s| format!(".{s}.tmp"));
+    path.with_file_name(file)
+}
+
+fn write_lines_atomic(path: &Path, lock_path: &Path, lines: &[String]) -> io::Result<()> {
     let mut out = lines.join("\n");
     if !out.is_empty() {
         out.push('\n');
     }
-    fs::write(path, out)
+    write_string_atomic_locked(path, lock_path, &out)
+}
+
+fn write_string_atomic(path: &Path, content: &str) -> io::Result<()> {
+    with_file_lock(path, |lock_path| write_string_atomic_locked(path, lock_path, content))
+}
+
+fn write_string_atomic_locked(path: &Path, lock_path: &Path, content: &str) -> io::Result<()> {
+    let temp_path = temp_path_for(path);
+    if temp_path == lock_path {
+        return Err(io::Error::new(
+            ErrorKind::Other,
+            format!("temp and lock paths collide for {}", path.display()),
+        ));
+    }
+    let mut temp = File::create(&temp_path)?;
+    temp.write_all(content.as_bytes())?;
+    temp.sync_all()?;
+    drop(temp);
+    fs::rename(temp_path, path)
 }
 
 fn task_line_indices(lines: &[String]) -> Vec<usize> {
@@ -1715,7 +1815,7 @@ fn today_ymd() -> String {
 }
 
 fn set_current_file(app: &AppPaths, file: &TaskFile) -> io::Result<()> {
-    fs::write(&app.current_file, task_file_key(file))
+    write_string_atomic(&app.current_file, &task_file_key(file))
 }
 
 fn parse_task_file(value: &str) -> Option<TaskFile> {
@@ -2125,33 +2225,8 @@ fn alarm_trigger_time(task: &DisplayTaskLine) -> Option<String> {
 }
 
 fn generate_new_task_id(app: &AppPaths) -> Result<String, String> {
-    let files = all_task_files(app).map_err(|e| format!("failed to collect files: {e}"))?;
-    let mut taken: HashSet<String> = HashSet::new();
-    for file in files {
-        let path = task_file_path(app, &file);
-        let lines = read_lines(&path)
-            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
-        for idx in task_line_indices(&lines) {
-            if let Some(id) = extract_task_id(&lines[idx]) {
-                taken.insert(id);
-            }
-        }
-    }
-
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    for attempt in 0u64..5000 {
-        let candidate = format!(
-            "{:06x}",
-            ((seed.wrapping_add(attempt * 977)) & 0x00ff_ffff) as u32
-        );
-        if !taken.contains(&candidate) {
-            return Ok(candidate);
-        }
-    }
-    Err("failed to generate unique task id".to_string())
+    let mut taken = collect_taken_task_ids(app)?;
+    generate_unique_task_id(&mut taken)
 }
 
 fn selection_files(app: &AppPaths, selection: &DoneSelection) -> Result<Vec<TaskFile>, String> {
@@ -2195,38 +2270,291 @@ fn parse_task_line(line: &str) -> Option<ParsedTaskLine> {
         return None;
     };
 
-    let mut text = line[6..].to_string();
-    let mut id = None;
-    if let Some(found_id) = extract_task_id(&text) {
-        if let Some((head, _)) = text.rsplit_once(" 🆔 ") {
-            text = head.to_string();
-            id = Some(found_id);
-        }
-    }
+    let body = &line[6..];
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let mut text_tokens: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    let mut due: Option<String> = None;
+    let mut id: Option<String> = None;
+    let mut recurrence: Option<Recurrence> = None;
+    let mut done_at: Option<String> = None;
 
-    let mut due = None;
-    if let Some((head, tail)) = text.rsplit_once(" 📅 ") {
-        let token = tail.split_whitespace().next().unwrap_or("");
-        if is_valid_date(token) {
-            due = Some(token.to_string());
-            text = head.to_string();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if let Some(tag) = token.strip_prefix('#') {
+            if !tag.is_empty() {
+                tags.push(tag.to_string());
+            }
+            i += 1;
+            continue;
         }
+        if token == "📅" && i + 1 < tokens.len() && is_valid_date(tokens[i + 1]) {
+            due = Some(tokens[i + 1].to_string());
+            i += 2;
+            continue;
+        }
+        if token == "✅" && i + 1 < tokens.len() && is_valid_date(tokens[i + 1]) {
+            done_at = Some(tokens[i + 1].to_string());
+            i += 2;
+            continue;
+        }
+        if token == "🔁" && i + 1 < tokens.len() {
+            if let Some(value) = parse_recurrence_value(tokens[i + 1]) {
+                recurrence = Some(value);
+                i += 2;
+                continue;
+            }
+        }
+        if token == "🆔" && i + 1 < tokens.len() {
+            let raw = tokens[i + 1].to_ascii_lowercase();
+            if raw.len() == 6 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+                id = Some(raw);
+            }
+            i += 2;
+            continue;
+        }
+        if (token == "⏰" || token == "👤") && i + 1 < tokens.len() {
+            i += 2;
+            continue;
+        }
+        text_tokens.push(token.to_string());
+        i += 1;
     }
-
-    let tags = text
-        .split_whitespace()
-        .filter_map(|token| token.strip_prefix('#'))
-        .filter(|tag| !tag.is_empty())
-        .map(|tag| tag.to_string())
-        .collect();
 
     Some(ParsedTaskLine {
         done,
-        text: text.trim().to_string(),
+        text: text_tokens.join(" ").trim().to_string(),
         tags,
         due,
         id,
+        recurrence,
+        done_at,
     })
+}
+
+fn parse_recurrence_value(value: &str) -> Option<Recurrence> {
+    match value {
+        "daily" => Some(Recurrence::Daily),
+        "weekly" => Some(Recurrence::Weekly),
+        "monthly" => Some(Recurrence::Monthly),
+        "weekdays" => Some(Recurrence::Weekdays),
+        _ => None,
+    }
+}
+
+fn recurrence_value_str(value: Recurrence) -> &'static str {
+    match value {
+        Recurrence::Daily => "daily",
+        Recurrence::Weekly => "weekly",
+        Recurrence::Monthly => "monthly",
+        Recurrence::Weekdays => "weekdays",
+    }
+}
+
+fn contains_case_insensitive(haystack: &str, needle_lower: &str) -> bool {
+    haystack.to_lowercase().contains(needle_lower)
+}
+
+fn next_recurring_due(completed_on: &str, recurrence: Recurrence) -> Option<String> {
+    match recurrence {
+        Recurrence::Daily => add_days(completed_on, 1),
+        Recurrence::Weekly => add_days(completed_on, 7),
+        Recurrence::Monthly => add_month(completed_on),
+        Recurrence::Weekdays => next_weekday(completed_on),
+    }
+}
+
+fn add_days(date: &str, days: i64) -> Option<String> {
+    let (y, m, d) = parse_ymd(date)?;
+    let base = days_from_civil(y, m, d);
+    let (ny, nm, nd) = civil_from_days(base + days);
+    Some(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+fn add_month(date: &str) -> Option<String> {
+    let (mut y, mut m, d) = parse_ymd(date)?;
+    m += 1;
+    if m > 12 {
+        m = 1;
+        y += 1;
+    }
+    let mdays = days_in_month(y, m);
+    let day = d.min(mdays);
+    Some(format!("{y:04}-{m:02}-{day:02}"))
+}
+
+fn next_weekday(date: &str) -> Option<String> {
+    let mut n = add_days(date, 1)?;
+    loop {
+        let (y, m, d) = parse_ymd(&n)?;
+        let weekday = ((days_from_civil(y, m, d) + 4).rem_euclid(7)) as i32;
+        if (1..=5).contains(&weekday) {
+            return Some(n);
+        }
+        n = add_days(&n, 1)?;
+    }
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 31,
+    }
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
+}
+
+fn collect_taken_task_ids(app: &AppPaths) -> Result<HashSet<String>, String> {
+    let files = all_task_files(app).map_err(|e| format!("failed to collect files: {e}"))?;
+    let mut taken: HashSet<String> = HashSet::new();
+    for file in files {
+        let path = task_file_path(app, &file);
+        let lines = read_lines(&path)
+            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+        for idx in task_line_indices(&lines) {
+            if let Some(id) = extract_task_id(&lines[idx]) {
+                taken.insert(id);
+            }
+        }
+    }
+    Ok(taken)
+}
+
+fn generate_unique_task_id(taken: &mut HashSet<String>) -> Result<String, String> {
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    for attempt in 0u64..5000 {
+        let candidate = format!(
+            "{:06x}",
+            ((seed.wrapping_add(attempt * 977)) & 0x00ff_ffff) as u32
+        );
+        if !taken.contains(&candidate) {
+            taken.insert(candidate.clone());
+            return Ok(candidate);
+        }
+    }
+    Err("failed to generate unique task id".to_string())
+}
+
+fn recur_signature(text: &str, tags: &[String], recurrence: Recurrence, due: &str) -> String {
+    let mut tags = tags.to_vec();
+    tags.sort();
+    format!(
+        "{}|{}|{}|{}",
+        text.trim(),
+        tags.join(","),
+        recurrence_value_str(recurrence),
+        due
+    )
+}
+
+fn run_recur(app: &AppPaths, print_each: bool) -> Result<usize, String> {
+    let today = today_ymd();
+    let files = all_task_files(app).map_err(|e| format!("failed to read files: {e}"))?;
+    let mut created_total = 0usize;
+    let mut taken_ids = collect_taken_task_ids(app)?;
+
+    for file in files {
+        let path = task_file_path(app, &file);
+        let lines = read_lines(&path)
+            .map_err(|e| format!("failed to read {}: {e}", task_file_filename(&file)))?;
+        let mut existing_open: HashSet<String> = HashSet::new();
+        let mut to_append: Vec<String> = Vec::new();
+
+        for idx in task_line_indices(&lines) {
+            let line = &lines[idx];
+            let Some(parsed) = parse_task_line(line) else {
+                continue;
+            };
+            let (Some(recurrence), Some(due)) = (parsed.recurrence, parsed.due.as_ref()) else {
+                continue;
+            };
+            if !parsed.done {
+                existing_open.insert(recur_signature(&parsed.text, &parsed.tags, recurrence, due));
+            }
+        }
+
+        for idx in task_line_indices(&lines) {
+            let line = &lines[idx];
+            let Some(parsed) = parse_task_line(line) else {
+                continue;
+            };
+            if !parsed.done {
+                continue;
+            }
+            let (Some(recurrence), Some(done_at)) = (parsed.recurrence, parsed.done_at.as_ref())
+            else {
+                continue;
+            };
+            let Some(next_due) = next_recurring_due(done_at, recurrence) else {
+                continue;
+            };
+            if next_due.as_str() > today.as_str() {
+                continue;
+            }
+
+            let signature = recur_signature(&parsed.text, &parsed.tags, recurrence, &next_due);
+            if existing_open.contains(&signature) {
+                continue;
+            }
+
+            let text = parsed.text.clone();
+            let tags = parsed.tags.clone();
+            let new_id = generate_unique_task_id(&mut taken_ids)?;
+            let mut new_line = format!("- [ ] {}", text);
+            for tag in tags {
+                new_line.push(' ');
+                new_line.push('#');
+                new_line.push_str(&tag);
+            }
+            new_line.push_str(" 📅 ");
+            new_line.push_str(&next_due);
+            new_line.push_str(" 🔁 ");
+            new_line.push_str(recurrence_value_str(recurrence));
+            new_line.push_str(" 🆔 ");
+            new_line.push_str(&new_id);
+            to_append.push(new_line);
+            existing_open.insert(signature);
+            created_total += 1;
+            if print_each {
+                println!("Created recurring task: [{}] → {}", text, next_due);
+            }
+        }
+
+        if !to_append.is_empty() {
+            append_lines(&path, &to_append)
+                .map_err(|e| format!("failed to write {}: {e}", task_file_filename(&file)))?;
+        }
+    }
+
+    Ok(created_total)
 }
 
 fn collect_tasks_for_file(app: &AppPaths, file: &TaskFile) -> Result<Vec<TaskJsonRecord>, String> {
@@ -2481,7 +2809,8 @@ fn write_app_config(app: &AppPaths, cfg: &AppConfig) -> Result<(), String> {
         json_string(&cfg.watch.handler),
         cfg.watch.interval.max(1)
     );
-    fs::write(&app.config_file, content).map_err(|e| format!("failed to write config: {e}"))
+    write_string_atomic(&app.config_file, &content)
+        .map_err(|e| format!("failed to write config: {e}"))
 }
 
 fn set_config_value(app: &AppPaths, key: &str, value: ConfigValue) -> Result<(), String> {
@@ -2602,7 +2931,9 @@ Commands:\n\
   dodo config get watch.handler|watch.interval\n\
   dodo config set watch.handler|watch.interval <value>\n\
   dodo status [--json]\n\
-  dodo overdue [--json]\n"
+  dodo overdue [--json]\n\
+  dodo recur\n\
+  dodo search [--json] \"query\"\n"
 }
 
 fn print_help() {
